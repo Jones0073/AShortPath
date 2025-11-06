@@ -794,7 +794,7 @@ def path_walk_to(
         urgent_val = max(0.0, min(1.0, urg_ema))
 
         # Apply look with adaptive urgency
-        minescript.echo("Urgency: {:.3f} (raw {:.3f})".format(urgent_val, urgent_val_raw))
+        # minescript.echo("Urgency: {:.3f} (raw {:.3f})".format(urgent_val, urgent_val_raw))
         look(yaw, pitch, urgent=urgent_val)
 
         # Movement: drive towards *target direction*, independent of camera smoothing
