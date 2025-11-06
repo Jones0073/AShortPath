@@ -504,6 +504,92 @@ def jump_loop(path_ref):
                 minescript.player_press_jump(False)
                 last_jump_time = time.time()
 
+def _horizontal_dist(p, q):
+    return math.hypot(q[0]-p[0], q[2]-p[2])
+
+def _wrap_deg(a: float) -> float:
+    """Wrap to [-180, 180)."""
+    return (a + 180.0) % 360.0 - 180.0
+
+def _angle_between_flat(u, v) -> float:
+    """Angle in degrees between two horizontal vectors u and v (ignores Y)."""
+    ux, uz = u[0], u[2]
+    vx, vz = v[0], v[2]
+    nu = math.hypot(ux, uz)
+    nv = math.hypot(vx, vz)
+    if nu < 1e-6 or nv < 1e-6:
+        return 0.0
+    dot = (ux*vx + uz*vz) / (nu*nv)
+    dot = max(-1.0, min(1.0, dot))
+    return math.degrees(math.acos(dot))
+
+def _compute_urgency(
+    p, a, b, c_or_none,
+    yaw_now, pitch_now, yaw_target, pitch_target,
+    *,
+    full_at: float = 2.0,        # distance for "forward" urgency to reach 1 (only when badly mis-aimed)
+    turn_full: float = 35.0,     # turn angle where straight-chain damper stops damping
+    pitch_full: float = 25.0,    # pitch error where pitch damper stops damping
+    turn_boost_deg: float = 35.0,# start anticipating turns of at least this size
+    offaxis_full: float = 1,  # lateral miss (in blocks) for full off-axis urgency
+    straight_relax: float = 0.35 # min factor on long straights (0.45..1 range)
+):
+    """
+    Urgency in [0,1] that stays *low* on long straights when you're already aligned.
+    Core idea: distance alone shouldn't spike urgency unless you're off-axis or a turn is imminent.
+    """
+
+    def clamp01(x): 
+        return 0.0 if x < 0.0 else 1.0 if x > 1.0 else x
+
+    # --- Geometry / errors ---
+    d = _horizontal_dist(p, b)
+    yaw_err_deg = abs(_wrap_deg(yaw_target - yaw_now))
+    yaw_unit = clamp01(yaw_err_deg / 30.0)  # 30° => full yaw urgency
+
+    # Lateral (off-axis) miss relative to where we're currently looking.
+    # If you're perfectly aligned, this is ~0 even for large d.
+    lateral_err = d * math.sin(math.radians(yaw_err_deg))
+    urg_offaxis = clamp01(lateral_err / max(1e-6, offaxis_full))
+
+    # Forward distance urgency is *gated by yaw error*: when aligned it contributes only a small base.
+    s = clamp01(d / max(1e-6, full_at))
+    # 15% baseline when aligned, rising toward full as yaw error grows.
+    urg_forward = s * (0.15 + 0.85 * yaw_unit)
+
+    # Base urgency prefers "need to rotate" over "far but already aligned".
+    base = max(urg_offaxis, yaw_unit, urg_forward)
+
+    # --- Turn anticipation (lookahead b->c) ---
+    turn_gain = 1.0
+    turn_deg = 0.0
+    if c_or_none is not None:
+        v1 = (b[0]-a[0], b[1]-a[1], b[2]-a[2])
+        v2 = (c_or_none[0]-b[0], c_or_none[1]-b[1], c_or_none[2]-b[2])
+        turn_deg = _angle_between_flat(v1, v2)
+        # Only boost if a real turn is coming *and* we're close enough that looking early helps.
+        if turn_deg >= turn_boost_deg and 0.6 <= d <= 3.0:
+            turn_gain = 1.0 + min(0.30, (turn_deg - turn_boost_deg) / 90.0)
+
+    # --- Dampers ---
+    # Straight-chain damper: strong on long straights, fades out by ~turn_full degrees.
+    if c_or_none is not None:
+        straight_factor = straight_relax + (1.0 - straight_relax) * clamp01(turn_deg / max(1e-6, turn_full))
+    else:
+        straight_factor = 1.0
+
+    # Pitch damper: barely trims when pitch is already good.
+    pitch_err = abs(pitch_target - pitch_now)
+    pitch_mix = 0.8 + 0.2 * clamp01(pitch_err / max(1e-6, pitch_full))  # 0.8..1.0
+
+    # --- Combine ---
+    urg = base * turn_gain * straight_factor * pitch_mix
+
+    # NOTE: removed the old "force high urgency when far" and distance floors.
+    # That was the main reason urgency stayed high on long straight chains.
+
+    return clamp01(urg)
+
 # -- pathing -------------------------------------------------------------------
 from typing import List, Tuple, Optional
 
@@ -625,6 +711,15 @@ def path_walk_to(
     # Small hysteresis radius for node passing
     pass_eps = max(0.35, distance * 0.35)
 
+    urg_ema = 0.0
+    # more responsive than before
+    urg_alpha_up = 0.45   # how fast we ramp up when we need urgency
+    urg_alpha_dn = 0.22   # slower decay
+    # allow quick increases, limit how fast we drop
+    urg_delta_up_cap = 0.35
+    urg_delta_dn_cap = 0.15
+
+
     while True:
         px, py, pz = map(float, minescript.player_position())
         p = (px, py, pz)
@@ -672,8 +767,35 @@ def path_walk_to(
         pitch = -math.degrees(math.atan2(to[1], max(1e-6, flat)))
         pitch = max(-max_pitch_down, min(60.0, pitch))  # clamp
 
-        # Apply look (your implementation may smooth; that’s fine now)
-        look(yaw, pitch)
+        # --- Adaptive urgency ---
+        # Next-next node (for turn anticipation), if available:
+        c = centers[i+2] if (i + 2) < len(centers) else None
+        yaw_now, pitch_now = minescript.player_orientation()
+
+        urgent_val_raw = _compute_urgency(
+            p=p, a=a, b=b, c_or_none=c,
+            yaw_now=yaw_now, pitch_now=pitch_now,
+            yaw_target=yaw, pitch_target=pitch,
+            full_at=2.0,        # 100% urgency by 2 blocks
+            turn_full=35.0,     # straight-chain mix reaches 1 by ~45°
+            pitch_full=25.0,    # pitch mix reaches 1 by ~15°
+            turn_boost_deg=35.0 # anticipate turns ≥ ~35°
+        )
+
+        # Asymmetric EMA (fast up, slow down) with per-frame delta caps
+        delta = urgent_val_raw - urg_ema
+        if delta >= 0.0:
+            delta = min(delta, urg_delta_up_cap)
+            urg_ema = urg_ema + delta * urg_alpha_up
+        else:
+            delta = max(delta, -urg_delta_dn_cap)
+            urg_ema = urg_ema + delta * urg_alpha_dn
+
+        urgent_val = max(0.0, min(1.0, urg_ema))
+
+        # Apply look with adaptive urgency
+        minescript.echo("Urgency: {:.3f} (raw {:.3f})".format(urgent_val, urgent_val_raw))
+        look(yaw, pitch, urgent=urgent_val)
 
         # Movement: drive towards *target direction*, independent of camera smoothing
         move_dir = _norm((to[0], 0.0, to[2]))  # keep ground movement planar
