@@ -9,7 +9,7 @@ IGNORE_BLOCKS = {
     "minecraft:air", "minecraft:oak_sign", "minecraft:poppy", "minecraft:torch",
     "minecraft:ladder", "minecraft:vine", "minecraft:short_grass", "minecraft:short_dry_grass", "minecraft:tall_grass", "minecraft:sugar_cane",
     "minecraft:tall_dry_grass", "minecraft:snow", "minecraft:oak_sapling", "minecraft:stone_button", "minecraft:heavy_weighted_pressure_plate",
-    "minecraft:tripwire_hook"
+    "minecraft:tripwire_hook", "minecraft:firefly_bush", "minecraft:dandelion", "minecraft:bush"
 }
 MAX_VERTICAL_STEP = 1
 EYE_HEIGHT = 1.62

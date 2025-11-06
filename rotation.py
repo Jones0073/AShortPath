@@ -6,40 +6,48 @@ from dataclasses import dataclass
 @dataclass
 class HumanLookConfig:
     # Speed mapping (deg/sec)
-    min_speed: float = 35.0           # small corrections
-    max_speed: float = 260.0          # fast flicks
-    min_angle: float = 5.0            # below this, go slower & shorter
-    max_angle: float = 140.0          # above this, approach max_speed
+    min_speed: float = 35.0
+    max_speed: float = 260.0
+    min_angle: float = 5.0
+    max_angle: float = 140.0
 
     # Duration clamps (sec)
     min_duration: float = 0.045
     max_duration: float = 0.75
 
     # Path curvature (fraction of distance -> lateral offset)
-    max_curve_intensity: float = 0.18  # ~0..0.3 is reasonable
+    max_curve_intensity: float = 0.14      # tighter by default
 
     # Overshoot behavior
-    base_overshoot: float = 0.015      # fraction of distance
-    max_overshoot: float = 0.045
-    overshoot_bias: float = 0.55       # yaw gets a bit more than pitch
+    base_overshoot: float = 0.012          # slightly smaller baseline
+    max_overshoot: float = 0.040
+    overshoot_bias: float = 0.55
 
     # Jitter (hand tremor) during motion
-    jitter_deg: float = 0.04           # max instantaneous tremor amplitude
-    jitter_smooth: float = 0.85        # 0..1 (higher = smoother)
-    jitter_scale_small_moves: float = 0.5
+    jitter_deg: float = 0.04
+    jitter_smooth: float = 0.85
+    jitter_scale_small_moves: float = 0.35 # more suppression on small corrections
 
     # Cadence / timing
-    target_hz: float = 120.0           # try ~120 updates/sec
-    step_jitter: float = 0.25          # per-step sleep randomness
+    target_hz: float = 120.0
+    step_jitter: float = 0.22
 
     # End micro-settle
     micro_settle_deg: float = 0.06
-    micro_settle_steps: int = 4
+    micro_settle_steps: int = 3
 
     # General
     deadzone_deg: float = 0.05
     pitch_min: float = -89.9
     pitch_max: float = 89.9
+
+    # New: “tight lock” & gating
+    no_overshoot_deg: float = 8.0          # below this, force 0 overshoot
+    no_curve_deg: float = 10.0             # below this, path stays straight
+    lock_cone_deg: float = 0.85            # hold aim inside this cone
+    lock_time: float = 0.08                # seconds of cone hold
+    lock_servo_speed: float = 110.0        # deg/sec for tiny servo nibbles
+
 
 CFG = HumanLookConfig()
 
@@ -57,7 +65,6 @@ def _hypot2(a: float, b: float) -> float:
 
 def _min_jerk(t: float) -> float:
     """Quintic minimum-jerk easing (0..1 -> 0..1)."""
-    # s(t) = 10 t^3 - 15 t^4 + 6 t^5
     t3 = t * t * t
     t4 = t3 * t
     t5 = t4 * t
@@ -70,21 +77,18 @@ def _map_speed(ang: float, cfg: HumanLookConfig) -> float:
     if ang >= cfg.max_angle:
         return cfg.max_speed
     r = (ang - cfg.min_angle) / (cfg.max_angle - cfg.min_angle)
-    # gentle ease-in to max
     r = r ** 0.7
     return cfg.min_speed + (cfg.max_speed - cfg.min_speed) * r
 
 def _lateral_curve(ang: float, cfg: HumanLookConfig) -> float:
     """How strong the curved path should be (as a fraction of ang)."""
-    # more curve for medium/large angles; tiny corrections stay straight
     r = _clamp((ang - cfg.min_angle) / (cfg.max_angle - cfg.min_angle), 0.0, 1.0)
     return cfg.max_curve_intensity * (r ** 1.2)
 
-def _overshoot_frac(ang: float, cfg: HumanLookConfig) -> float:
-    """Fraction of distance to overshoot, randomized and distance-aware."""
+def _overshoot_frac_raw(ang: float, cfg: HumanLookConfig) -> float:
+    """Baseline overshoot fraction (distance-aware + random)."""
     r = _clamp((ang - cfg.min_angle) / (cfg.max_angle - cfg.min_angle), 0.0, 1.0)
     base = cfg.base_overshoot + (cfg.max_overshoot - cfg.base_overshoot) * (r ** 0.9)
-    # Randomize ~±25%
     return base * (0.75 + 0.5 * random.random())
 
 def _sleep_step(dt: float, cfg: HumanLookConfig):
@@ -95,7 +99,8 @@ def _sleep_step(dt: float, cfg: HumanLookConfig):
 
 def _move_segment(a0: float, b0: float, dy: float, dp: float, duration: float,
                   lateral_frac: float, cfg: HumanLookConfig,
-                  jitter_state: dict | None = None):
+                  jitter_state: dict | None = None,
+                  jitter_scale_override: float | None = None):
     """
     Move from (a0,b0) by (dy,dp) in 'duration' seconds with curved path & smooth jitter.
     lateral_frac: 0..~0.3 times total distance, applied orthogonal to direction.
@@ -107,7 +112,6 @@ def _move_segment(a0: float, b0: float, dy: float, dp: float, duration: float,
     # Orthogonal unit vector in yaw-pitch plane
     ang = max(_hypot2(dy, dp), 1e-6)
     ux, uy = dy / ang, dp / ang
-    # Perp rotates (ux,uy) by +90° => (-uy, ux)
     px, py = -uy, ux
 
     # Smooth jitter state
@@ -115,8 +119,10 @@ def _move_segment(a0: float, b0: float, dy: float, dp: float, duration: float,
         jitter_state = {"jy": 0.0, "jp": 0.0}
     jy, jp = jitter_state["jy"], jitter_state["jp"]
 
-    # Scale jitter for smaller moves
-    jitter_scale = cfg.jitter_scale_small_moves if ang < 12.0 else 1.0
+    # Scale jitter for smaller moves or override for lock phase
+    base_scale = cfg.jitter_scale_small_moves if ang < 12.0 else 1.0
+    if jitter_scale_override is not None:
+        base_scale = jitter_scale_override
 
     for i in range(1, steps + 1):
         t = i / steps
@@ -135,13 +141,13 @@ def _move_segment(a0: float, b0: float, dy: float, dp: float, duration: float,
         # Smooth jitter (IIR filtered random)
         jy = cfg.jitter_smooth * jy + (1.0 - cfg.jitter_smooth) * (random.random() - 0.5)
         jp = cfg.jitter_smooth * jp + (1.0 - cfg.jitter_smooth) * (random.random() - 0.5)
-        jitter_yaw = cfg.jitter_deg * jy * jitter_scale
-        jitter_pitch = cfg.jitter_deg * jp * jitter_scale
+        jitter_yaw = cfg.jitter_deg * jy * base_scale
+        jitter_pitch = cfg.jitter_deg * jp * base_scale
 
         yaw = a0 + byaw + lyaw + jitter_yaw
         pitch = _clamp(b0 + bpitch + lpitch + jitter_pitch, cfg.pitch_min, cfg.pitch_max)
 
-        # Wrap yaw to Minecraft’s expected range (helps avoid huge jumps)
+        # Wrap yaw to Minecraft’s expected range
         yaw = _wrap_deg(yaw)
 
         ms.player_set_orientation(yaw, pitch)
@@ -169,20 +175,36 @@ def look(target_yaw: float, target_pitch: float, cfg: HumanLookConfig = CFG):
     if ang < cfg.deadzone_deg:
         return
 
+    # ----- Adaptive gating: disable risky behaviors near the target -----
+    no_overshoot = ang <= cfg.no_overshoot_deg
+    no_curve = ang <= cfg.no_curve_deg
+
+    # If we are near yaw wrap (+/-180°), kill overshoot to avoid long spins
+    wrap_proximity = abs(abs(dy) - 180.0)
+    near_wrap = wrap_proximity <= 18.0  # within 18° of the seam
+
     # Distance->speed->duration mapping with light randomness
     speed = _map_speed(ang, cfg)
     base_T = _clamp(ang / max(1e-6, speed), cfg.min_duration, cfg.max_duration)
-    duration = base_T * (0.9 + 0.2 * random.random())
+    # Small moves: slightly shorter; big moves: allow full base_T ±10%
+    lerp = 0.9 + 0.2 * random.random()
+    duration = base_T * (0.92 * lerp if ang < 15.0 else lerp)
 
     # Curved path intensity
-    lateral_frac = _lateral_curve(ang, cfg) * (0.85 + 0.3 * random.random())
+    lateral_frac = 0.0 if no_curve else _lateral_curve(ang, cfg) * (0.85 + 0.3 * random.random())
 
     # Overshoot
-    over_frac = _overshoot_frac(ang, cfg)
-    overshoot_y = dy * over_frac * (cfg.overshoot_bias + 0.2 * (random.random() - 0.5))
-    overshoot_p = dp * over_frac * (1.0 - cfg.overshoot_bias + 0.2 * (random.random() - 0.5))
+    if no_overshoot or near_wrap:
+        overshoot_y = 0.0
+        overshoot_p = 0.0
+    else:
+        over_frac = _overshoot_frac_raw(ang, cfg)
+        # slightly taper overshoot if pitch is dominant to avoid vertical wobble
+        axis_mix = cfg.overshoot_bias if abs(dy) >= abs(dp) else (cfg.overshoot_bias * 0.8)
+        overshoot_y = dy * over_frac * (axis_mix + 0.22 * (random.random() - 0.5))
+        overshoot_p = dp * over_frac * ((1.0 - axis_mix) + 0.22 * (random.random() - 0.5))
 
-    # 1) Main move to slightly overshot point
+    # 1) Main move to (possibly) overshot point
     jitter_state = _move_segment(
         a, b,
         dy + overshoot_y, dp + overshoot_p,
@@ -199,7 +221,7 @@ def look(target_yaw: float, target_pitch: float, cfg: HumanLookConfig = CFG):
 
     if corr_ang >= cfg.deadzone_deg * 0.5:
         corr_speed = max(cfg.min_speed * 0.7, _map_speed(corr_ang, cfg) * 0.6)
-        corr_T = _clamp(corr_ang / corr_speed, cfg.min_duration * 0.6, cfg.min_duration * 1.6)
+        corr_T = _clamp(corr_ang / corr_speed, cfg.min_duration * 0.55, cfg.min_duration * 1.45)
         _move_segment(
             _wrap_deg(a + dy + overshoot_y),
             _clamp(b + dp + overshoot_p, cfg.pitch_min, cfg.pitch_max),
@@ -210,25 +232,57 @@ def look(target_yaw: float, target_pitch: float, cfg: HumanLookConfig = CFG):
             jitter_state=jitter_state
         )
 
-    # 3) Tiny settle oscillations (very small, very quick)
-    #    Helps avoid robotic "pixel-perfect stop".
+    # 3) Snap-to if still off a hair (fast, straight, jitterless)
     sy, sp = ms.player_orientation()
     rem_dy = _wrap_deg(target_yaw - sy)
     rem_dp = _clamp(target_pitch, cfg.pitch_min, cfg.pitch_max) - sp
-    if _hypot2(rem_dy, rem_dp) > cfg.deadzone_deg * 0.6:
-        _move_segment(sy, sp, rem_dy, rem_dp,
-                      cfg.min_duration * 0.8,
-                      0.0, cfg, jitter_state=jitter_state)
+    rem_ang = _hypot2(rem_dy, rem_dp)
 
-    # A couple of micro-settle nudges around the final to emulate hand release
+    if rem_ang > cfg.deadzone_deg * 0.6:
+        snap_speed = max(cfg.min_speed, cfg.lock_servo_speed)
+        snap_T = _clamp(rem_ang / snap_speed, cfg.min_duration * 0.45, cfg.min_duration * 0.9)
+        _move_segment(
+            sy, sp, rem_dy, rem_dp,
+            snap_T,
+            0.0,  # no curve
+            cfg,
+            jitter_state=jitter_state,
+            jitter_scale_override=0.0  # suppress jitter for final line-up
+        )
+
+    # 4) Very short “lock cone” servo: keep aim steady so we don't drift past nodes
+    #    (human-like tiny hand hold). Time-capped.
+    lock_deadline = time.time() + cfg.lock_time
+    while time.time() < lock_deadline:
+        cy, cp = ms.player_orientation()
+        edy = _wrap_deg(target_yaw - cy)
+        edp = _clamp(target_pitch, cfg.pitch_min, cfg.pitch_max) - cp
+        eang = _hypot2(edy, edp)
+        if eang <= cfg.lock_cone_deg:
+            # hold without motion but continue frame pacing (prevents robotic hard stop)
+            _sleep_step(1.0 / cfg.target_hz, cfg)
+            continue
+        # tiny corrective nibble straight towards target, no curve, no jitter
+        nib_speed = cfg.lock_servo_speed
+        nib_T = _clamp(eang / nib_speed, cfg.min_duration * 0.35, cfg.min_duration * 0.6)
+        _move_segment(
+            cy, cp, edy, edp,
+            nib_T,
+            0.0,
+            cfg,
+            jitter_state=jitter_state,
+            jitter_scale_override=0.0
+        )
+
+    # 5) A couple of micro-settle nudges (very small, very quick) for human feel
     for k in range(cfg.micro_settle_steps):
         sy, sp = ms.player_orientation()
         jitter = cfg.micro_settle_deg * (0.6 ** k)
         nudge_y = (random.random() - 0.5) * 2.0 * jitter
         nudge_p = (random.random() - 0.5) * 2.0 * jitter * 0.7
         _move_segment(sy, sp, nudge_y, nudge_p,
-                      cfg.min_duration * 0.35,
-                      0.0, cfg)
+                      cfg.min_duration * 0.32,
+                      0.0, cfg, jitter_scale_override=0.25)
 
     # Final exact set (prevents drift from accumulating)
     ms.player_set_orientation(_wrap_deg(target_yaw), _clamp(target_pitch, cfg.pitch_min, cfg.pitch_max))
