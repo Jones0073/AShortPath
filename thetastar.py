@@ -6,9 +6,10 @@ from itertools import count
 AIRLIKE = {"minecraft:air", "minecraft:light"}
 LIQUIDS = {"minecraft:water", "minecraft:lava"}
 IGNORE_BLOCKS = {
-    "minecraft:air","minecraft:water","minecraft:lava","minecraft:carpet","minecraft:stairs","minecraft:sign","minecraft:flower","minecraft:torch",
-    "minecraft:ladder","minecraft:vine","minecraft:grass","minecraft:snow","minecraft:sapling","minecraft:button","minecraft:pressure_plate",
-    "minecraft:tripwire","minecraft:candle","minecraft:bell","minecraft:banner","minecraft:skull","minecraft:head"
+    "minecraft:air", "minecraft:oak_sign", "minecraft:poppy", "minecraft:torch",
+    "minecraft:ladder", "minecraft:vine", "minecraft:short_grass", "minecraft:short_dry_grass", "minecraft:tall_grass", "minecraft:sugar_cane",
+    "minecraft:tall_dry_grass", "minecraft:snow", "minecraft:oak_sapling", "minecraft:stone_button", "minecraft:heavy_weighted_pressure_plate",
+    "minecraft:tripwire_hook"
 }
 MAX_VERTICAL_STEP = 1
 EYE_HEIGHT = 1.62
